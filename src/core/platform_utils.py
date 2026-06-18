@@ -142,17 +142,22 @@ def show_notification(
     """统一的系统通知入口。
 
     Args:
-        tray_icon: 调用方传入的 QSystemTrayIcon 实例(由 MainWindow 持有)
+        tray_icon: 调用方传入的 tray 对象(QSystemTrayIcon 实例,
+                  macOS 上是 NSStatusItem 包装对象 —— 此参数 macOS 路径忽略)
         title: 通知标题
         message: 通知正文
         category_color: 分类颜色(当前仅作为接口占位,不影响实际显示)
         duration_ms: 通知显示时长(毫秒)
 
     行为:
-      - macOS:  tray_icon.showMessage(...)
+      - macOS:  走 show_macos_notification(NSUserNotification,已废弃但可用)
       - Windows 且 win10toast 可用: 走 win10toast(更接近系统通知样式)
-      - 其他 / win10toast 缺失: 降级到 tray_icon.showMessage
+      - 其他 / win10toast 缺失: 降级到 tray_icon.showMessage(QSystemTrayIcon)
     """
+    if is_macos():
+        show_macos_notification(title, message, duration_ms)
+        return
+
     if is_windows():
         try:
             from win10toast import ToastNotifier
@@ -164,7 +169,8 @@ def show_notification(
 
     from PyQt5.QtWidgets import QSystemTrayIcon
 
-    tray_icon.showMessage(title, message, QSystemTrayIcon.Information, duration_ms)
+    if hasattr(tray_icon, 'showMessage'):
+        tray_icon.showMessage(title, message, QSystemTrayIcon.Information, duration_ms)
 
 
 def make_tray_icon(size: int = 18):
@@ -292,3 +298,178 @@ def _make_tray_icon_qpixmap(size: int):
         p.end()
 
     return QIcon(pix)
+
+
+class _MacosStatusItemTarget:
+    """NSMenuItem target,把 macOS selector 调用桥接到 Python 回调。
+
+    macOS 的 NSMenuItem 必须通过 target-action 模式响应点击:
+      item.setTarget_(target)
+      item.setAction_("invoke_show:")
+    target 需要响应 invoke_show: selector。这里把 selector 实现为 Python 回调。
+
+    实现说明:为避免在 Windows/Linux 模块导入时强依赖 pyobjc,
+    这个类用 type() 在 _make_macos_target_class() 内动态创建,
+    实际继承 NSObject + objc.super。
+    """
+
+
+_macos_target_class_cache = None
+
+
+def _make_macos_target_class():
+    """动态创建继承 NSObject 的 target class,只在 macOS 上调用一次。
+
+    pyobjc 不允许重复定义同名 Objective-C class,所以必须模块级缓存。
+    第二次及之后的调用直接返回已创建的 class。
+    """
+    global _macos_target_class_cache
+    if _macos_target_class_cache is not None:
+        return _macos_target_class_cache
+
+    import objc
+    from AppKit import NSObject
+
+    class _MacosStatusItemTargetImpl(NSObject):
+        def initWithCallbacks_(self, callbacks):
+            self = objc.super(_MacosStatusItemTargetImpl, self).init()
+            if self is None:
+                return None
+            self._callbacks = callbacks
+            return self
+
+        def invokeShow_(self, sender):
+            if "show" in self._callbacks:
+                self._callbacks["show"]()
+
+        def invokeHide_(self, sender):
+            if "hide" in self._callbacks:
+                self._callbacks["hide"]()
+
+        def invokeQuit_(self, sender):
+            if "quit" in self._callbacks:
+                self._callbacks["quit"]()
+
+    _macos_target_class_cache = _MacosStatusItemTargetImpl
+    return _macos_target_class_cache
+
+
+def create_macos_status_item(on_show, on_hide, on_quit,
+                              tooltip="DeskNoteX"):
+    """在 macOS 上直接用 NSStatusBar 创建状态栏项。
+
+    完全绕过 PyQt5 的 QSystemTrayIcon。QSystemTrayIcon.setIcon(QIcon)
+    在 PyQt5 内部把 QIcon 转 NSImage 时会强制把 isTemplate 设为 False,
+    导致 macOS menu bar 不应用圆形遮罩 —— 用户看到完整方形图片。
+
+    这里直接走 NSStatusBar.setImage_(template_NSImage),让 macOS
+    真正按 template image 处理(自动反色 + 应用 menu bar 圆形遮罩)。
+
+    Args:
+        on_show: Python 回调,菜单"显示"项点击时触发
+        on_hide: Python 回调,菜单"隐藏"项点击时触发
+        on_quit: Python 回调,菜单"退出"项点击时触发
+        tooltip: 鼠标 hover 显示的文字
+
+    Returns:
+        (status_item, target_obj, bar) 元组:
+        - status_item: NSStatusItem 实例
+        - target_obj: NSObject 持有,防止 GC 后 selector 失效
+        - bar: NSStatusBar 实例(用于 removeStatusItem_)
+    """
+    from AppKit import (
+        NSStatusBar, NSImage, NSColor, NSBezierPath,
+        NSMenu, NSMenuItem,
+    )
+
+    # 1. 创建 template NSImage(纯黑 + alpha 便签本图形)
+    size = 22  # macOS menu bar 标准尺寸
+    img = NSImage.alloc().initWithSize_((size, size))
+    img.setTemplate_(True)
+    img.lockFocus()
+    try:
+        NSColor.colorWithCalibratedWhite_alpha_(0.0, 1.0).set()
+        path = NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
+            ((2, 2), (size - 4, size - 4)), 2, 2,
+        )
+        path.fill()
+        NSColor.colorWithCalibratedWhite_alpha_(1.0, 0.75).set()
+        for i in range(3):
+            y = 6 + i * 3
+            if y + 1 > size - 2:
+                break
+            NSBezierPath.fillRect_(((4, y), (size - 8, 1)))
+    finally:
+        img.unlockFocus()
+
+    # 2. 创建 status item
+    bar = NSStatusBar.systemStatusBar()
+    item = bar.statusItemWithLength_(-1.0)  # NSVariableStatusItemLength
+    item.setImage_(img)
+    item.setToolTip_(tooltip)
+
+    # 3. 创建菜单 + target
+    target_cls = _make_macos_target_class()
+    target = target_cls.alloc().initWithCallbacks_({
+        "show": on_show,
+        "hide": on_hide,
+        "quit": on_quit,
+    })
+
+    menu = NSMenu.alloc().init()
+
+    show_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+        "显示", "invokeShow:", "",
+    )
+    show_item.setTarget_(target)
+    menu.addItem_(show_item)
+
+    hide_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+        "隐藏", "invokeHide:", "",
+    )
+    hide_item.setTarget_(target)
+    menu.addItem_(hide_item)
+
+    menu.addItem_(NSMenuItem.separatorItem())
+
+    quit_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+        "退出", "invokeQuit:", "",
+    )
+    quit_item.setTarget_(target)
+    menu.addItem_(quit_item)
+
+    item.setMenu_(menu)
+
+    return item, target, bar
+
+
+def remove_macos_status_item(status_item, bar):
+    """从 menu bar 移除 NSStatusItem。"""
+    try:
+        bar.removeStatusItem_(status_item)
+    except Exception as exc:
+        print(
+            f"[platform_utils] remove_macos_status_item 失败: {exc}",
+            file=sys.stderr,
+        )
+
+
+def show_macos_notification(title, message, duration_ms=5000):
+    """在 macOS 上用 NSUserNotification 显示系统通知。
+
+    NSUserNotification 在 macOS 10.14+ 已废弃,但仍可用。UNUserNotificationCenter
+    需要 bundle ID 和 code signing,这里不引入这种复杂性。
+    """
+    try:
+        from AppKit import NSUserNotification, NSUserNotificationCenter
+        note = NSUserNotification.alloc().init()
+        note.setTitle_(str(title))
+        note.setInformativeText_(str(message))
+        center = NSUserNotificationCenter.defaultUserNotificationCenter()
+        if center is not None:
+            center.deliverNotification_(note)
+    except Exception as exc:
+        print(
+            f"[platform_utils] show_macos_notification 失败: {exc}",
+            file=sys.stderr,
+        )

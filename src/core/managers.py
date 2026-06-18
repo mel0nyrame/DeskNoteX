@@ -5,7 +5,10 @@ from PyQt5.QtWidgets import QSystemTrayIcon, QMenu, QAction, QApplication
 from PyQt5.QtGui import QIcon
 
 from .config import ConfigManager, DatabaseManager
-from .platform_utils import activate_application, make_tray_icon
+from .platform_utils import (
+    activate_application, make_tray_icon, is_macos,
+    create_macos_status_item, remove_macos_status_item,
+)
 
 
 class NotificationWorker(QThread):
@@ -59,17 +62,36 @@ class NotificationWorker(QThread):
         self.running = False
         self.wait()  # 无超时等待,确保 run() 收尾 close db 后再返回
 
+
 class TrayManager:
+    """系统托盘管理器。
+
+    macOS 上完全不用 QSystemTrayIcon —— 因为 PyQt5 的 QSystemTrayIcon.setIcon
+    在内部把 QIcon 转 NSImage 时会强制把 isTemplate 设为 False,导致 macOS menu bar
+    不应用圆形遮罩(用户看到完整方形图片)。改为直接用 NSStatusBar 创建 status item
+    + NSImage(template)+ NSMenu,让 macOS 真正按 template image 处理(自动反色 +
+    应用 menu bar 圆形遮罩)。
+
+    其他平台继续用 QSystemTrayIcon(行为不变)。
+    """
+
     def __init__(self, app, window, config):
         self.app = app
         self.window = window
         self.config = config
-        self.tray = QSystemTrayIcon(app)
+
+        if is_macos():
+            self._init_macos()
+        else:
+            self._init_qsystemtray()
+
+    def _init_qsystemtray(self):
+        """非 macOS 平台:用 QSystemTrayIcon(原行为不变)。"""
+        self.backend = "qsystemtray"
+        self.tray = QSystemTrayIcon(self.app)
         self.tray.setToolTip("DeskNoteX")
-        # 用程序绘制的 template icon(macOS 自动反色 + 应用圆形遮罩),
-        # 比 Qt 内置 SP_ComputerIcon(彩色,macOS 不遮罩)更符合 menu bar 视觉规范
         self.tray.setIcon(make_tray_icon(18))
-        
+
         menu = QMenu()
         show_action = QAction("显示", menu)
         show_action.triggered.connect(self.show_window)
@@ -84,7 +106,25 @@ class TrayManager:
         self.tray.setContextMenu(menu)
         self.tray.activated.connect(self.on_tray_activated)
         self.tray.show()
-    
+
+    def _init_macos(self):
+        """macOS 平台:直接用 NSStatusBar 创建 statusItem(template NSImage + NSMenu)。"""
+        self.backend = "nsstatus"
+        try:
+            self.status_item, self.status_target, self.status_bar = (
+                create_macos_status_item(
+                    on_show=self.show_window,
+                    on_hide=self.hide_window,
+                    on_quit=self.quit_app,
+                    tooltip="DeskNoteX",
+                )
+            )
+        except Exception as exc:
+            print(f"[TrayManager] NSStatusBar 创建失败,fallback 到 QSystemTrayIcon: {exc}",
+                  file=sys.stderr)
+            self.backend = "qsystemtray"
+            self._init_qsystemtray()
+
     def show_window(self):
         # macOS 上 hide() 会让整个 application 进入 hidden 状态,
         # 仅 unhide_ + activateIgnoringOtherApps 还不够,必须让 NSWindow
@@ -96,23 +136,36 @@ class TrayManager:
             self.window.show()
         self.window.raise_()
         self.window.activateWindow()
-    
+
     def hide_window(self):
         self.window.hide()
-    
+
     def on_tray_activated(self, reason):
+        """QSystemTrayIcon 双击响应(其他平台)。"""
         if reason == QSystemTrayIcon.DoubleClick:
             if self.window.isVisible():
                 self.window.hide()
             else:
                 self.show_window()
-    
+
     def quit_app(self):
-        self.tray.hide()
+        # tray 自身清理(QSystemTrayIcon 需要 hide,NSStatusItem 由 AppKit 管理)
+        if self.backend == "qsystemtray" and hasattr(self, "tray"):
+            self.tray.hide()
         # 让 MainWindow 走 closeEvent,统一收尾 refresh_timer + worker + db
-        if self.window and self.window.isVisible():
+        # (closeEvent 末尾会调 app.quit())
+        if self.window:
             self.window.close()
+        # 兜底:如果 window 已 hide 走不到 closeEvent,这里再 quit 一次
         self.app.quit()
+
+    def cleanup(self):
+        """应用退出前清理 tray 资源(可选,系统退出时不必)。"""
+        if self.backend == "nsstatus":
+            try:
+                remove_macos_status_item(self.status_item, self.status_bar)
+            except Exception as exc:
+                print(f"[TrayManager] cleanup 失败: {exc}", file=sys.stderr)
 
 class EdgeTuckManager:
     def __init__(self, window, config):
