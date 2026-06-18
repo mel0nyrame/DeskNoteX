@@ -165,3 +165,67 @@ def show_notification(
     from PyQt5.QtWidgets import QSystemTrayIcon
 
     tray_icon.showMessage(title, message, QSystemTrayIcon.Information, duration_ms)
+
+
+def make_tray_icon(size: int = 18):
+    """生成 macOS menu bar 用的 template icon。
+
+    macOS 的 menu bar (俗称"顶部状态栏",用户口语可能叫"docker 栏")
+    对 tray icon 有特殊规则:
+      1. 必须是 template image —— 只用黑色 + alpha,其他颜色被忽略
+      2. 系统自动反色:深色菜单栏下显示白色,浅色下显示黑色
+      3. 系统自动应用圆形遮罩 —— 让 icon 融入 menu bar 视觉
+
+    之前用 `QApplication.style().standardIcon(SP_ComputerIcon)` 是彩色
+    Qt 内置图标,macOS 不会应用圆形遮罩,所以用户看到的是完整方形图片。
+
+    这里程序化绘制一个简单的便签本图形(纯黑 + alpha),
+    满足 template image 规则,macOS 会自动圆形遮罩。
+
+    Args:
+        size: icon 像素尺寸,默认 18(macOS menu bar 标准尺寸)
+
+    Returns:
+        QIcon 实例,可直接传给 QSystemTrayIcon.setIcon(...)
+
+    参考:
+      https://developer.apple.com/design/human-interface-guidelines/menus
+      ("Use template images for menu bar icons" 一节)
+    """
+    from PyQt5.QtCore import Qt
+    from PyQt5.QtGui import QPixmap, QPainter, QColor, QIcon, QPainterPath
+
+    pix = QPixmap(size, size)
+    pix.fill(Qt.transparent)
+
+    p = QPainter(pix)
+    try:
+        p.setRenderHint(QPainter.Antialiasing)
+
+        margin = 2
+
+        # 便签本外形(圆角矩形,纯黑)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(0, 0, 0, 255))
+        p.drawRoundedRect(
+            margin, margin,
+            size - 2 * margin - 1, size - 2 * margin - 1,
+            2, 2,
+        )
+
+        # 3 条便签横线(白色 + 半透明,在黑色背景上可见)
+        # 模板图中白色像素 alpha > 0 的会被视为"挖空",让 menu bar 透出
+        p.setBrush(QColor(255, 255, 255, 220))
+        line_top = 6
+        line_spacing = max(2, (size - 2 * margin - 4) // 4)
+        line_left = margin + 2
+        line_right = size - margin - 2
+        for i in range(3):
+            y = line_top + i * line_spacing
+            if y + 1 > size - margin:
+                break
+            p.drawRect(line_left, y, line_right - line_left, 1)
+    finally:
+        p.end()
+
+    return QIcon(pix)

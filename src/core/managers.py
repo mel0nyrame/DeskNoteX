@@ -5,7 +5,7 @@ from PyQt5.QtWidgets import QSystemTrayIcon, QMenu, QAction, QApplication
 from PyQt5.QtGui import QIcon
 
 from .config import ConfigManager, DatabaseManager
-from .platform_utils import activate_application
+from .platform_utils import activate_application, make_tray_icon
 
 
 class NotificationWorker(QThread):
@@ -66,8 +66,9 @@ class TrayManager:
         self.config = config
         self.tray = QSystemTrayIcon(app)
         self.tray.setToolTip("DeskNoteX")
-        # Use a simple built-in icon if no custom one
-        self.tray.setIcon(QApplication.style().standardIcon(QApplication.style().SP_ComputerIcon))
+        # 用程序绘制的 template icon(macOS 自动反色 + 应用圆形遮罩),
+        # 比 Qt 内置 SP_ComputerIcon(彩色,macOS 不遮罩)更符合 menu bar 视觉规范
+        self.tray.setIcon(make_tray_icon(18))
         
         menu = QMenu()
         show_action = QAction("显示", menu)
