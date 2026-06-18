@@ -62,19 +62,22 @@ class MainWindow(QMainWindow):
         self.refresh_timer.start(30000)  # Refresh every 30s
     
     def _setup_ui(self):
-        self.setStyleSheet(get_stylesheet(self.theme, self.font_family, self.font_size))
-        
-        # Central container with rounded corners
+        # 把全局 stylesheet 应用到 self.container 而不是 self(MainWindow):
+        # styles.py 里有 "QWidget { background: window }",若设到 MainWindow 上
+        # 会覆盖 WA_TranslucentBackground,导致 MainWindow 不透明,
+        # 圆角之外的区域跟 container 同色,看起来"圆角没了"。
+        # 应用到 container 上后,MainWindow 保持透明,圆角清晰可见。
         self.container = QWidget(self)
         self.container.setObjectName("mainContainer")
-        self.container.setStyleSheet(f"""
+        self.container.setStyleSheet(get_stylesheet(self.theme, self.font_family, self.font_size))
+        self.container.setStyleSheet(self.container.styleSheet() + f"""
             QWidget#mainContainer {{
                 background: {self.theme['window']};
                 border-radius: 16px;
                 border: 1px solid {self.theme['border']};
             }}
         """)
-        
+
         main_layout = QVBoxLayout(self.container)
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(0)
@@ -371,8 +374,10 @@ class MainWindow(QMainWindow):
         return btn
     
     def _apply_theme(self):
-        self.setStyleSheet(get_stylesheet(self.theme, self.font_family, self.font_size))
-        self.container.setStyleSheet(f"""
+        # 同 _setup_ui:stylesheet 应用到 container 而非 MainWindow,
+        # 保留 WA_TranslucentBackground 让圆角之外的区域保持透明。
+        self.container.setStyleSheet(get_stylesheet(self.theme, self.font_family, self.font_size))
+        self.container.setStyleSheet(self.container.styleSheet() + f"""
             QWidget#mainContainer {{
                 background: {self.theme['window']};
                 border-radius: 16px;

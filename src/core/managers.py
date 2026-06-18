@@ -42,11 +42,15 @@ class NotificationWorker(QThread):
                 print(f"NotificationWorker error: {e}")
             sleep(30)  # Check every 30 seconds
 
+        # 在创建连接的同一线程里 close,避免 SQLite 跨线程访问错误。
+        if self.db:
+            self.db.close()
+
     def stop(self):
+        # 仅设置标志并等待线程退出;db.close() 由 run() 自己在子线程里调用,
+        # 保证 SQLite 连接只在创建它的线程里被使用。
         self.running = False
         self.wait(1000)
-        if self.db:
-            self.db.close()  # 关闭线程自己的连接
 
 class TrayManager:
     def __init__(self, app, window, config):
