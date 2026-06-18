@@ -84,14 +84,11 @@ class MainWindow(QMainWindow):
         title_bar.setSpacing(8)
 
         self.title_label = QLabel("DeskNoteX")
-        # "Forte" 是 Windows 上的装饰英文字体,macOS 不存在;
-        # macOS 上用 "Helvetica Neue" 避免 Qt 启动时打 "missing font family" 警告。
-        title_font_family = "Helvetica Neue" if is_macos() else "Forte"
         self.title_label.setStyleSheet(f"""
             QLabel {{
                 color: {self.theme['text']};
                 background: transparent;
-                font-family: "{title_font_family}";
+                font-family: "Forte";
                 font-size: {self.font_size + 6}px;
                 font-weight: bold;
                 border: none;
@@ -621,13 +618,16 @@ class MainWindow(QMainWindow):
     
     def _toggle_ontop(self, checked):
         self.config.set("always_on_top", checked)
-        # 使用 setWindowFlag(单数)切换单个标志,不会触发窗口重建,
-        # 避免 macOS 上 frameless hint 丢失 / 窗口位置错位。
-        # setWindowFlags(复数,做 | / &~ 操作)会重建窗口,在 macOS 上体验差。
-        self.setWindowFlag(Qt.WindowStaysOnTopHint, checked)
-        # 保险:某些 Qt 版本下 setWindowFlag 后仍需 show() 重新触发
-        if self.isVisible():
+        # Need to recreate window flags
+        was_visible = self.isVisible()
+        geo = self.geometry()
+        if checked:
+            self.setWindowFlags(self.windowFlags() | Qt.WindowStaysOnTopHint)
+        else:
+            self.setWindowFlags(self.windowFlags() & ~Qt.WindowStaysOnTopHint)
+        if was_visible:
             self.show()
+            self.setGeometry(geo)
     
     def _reload_theme(self):
         self.theme = self.config.get_theme()
