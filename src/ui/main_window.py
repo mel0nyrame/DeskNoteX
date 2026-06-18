@@ -9,10 +9,12 @@ from PyQt5.QtGui import QFont, QCursor, QColor,QIcon
 
 from ..core.config import ConfigManager, DatabaseManager
 from ..core.managers import NotificationWorker, TrayManager, EdgeTuckManager
+from ..core.platform_utils import is_macos
 from .styles import get_stylesheet, StyleHelper
 from .task_card import TaskCard, CategoryItem
 from .dialogs import TaskDialog
 from .settings_dialogs import SettingsDialog, StatsDialog
+from .traffic_lights import TrafficLightButtons
 
 class MainWindow(QMainWindow):
     theme_changed = pyqtSignal()
@@ -142,45 +144,57 @@ class MainWindow(QMainWindow):
         self.settings_btn.clicked.connect(self._show_settings_menu)
         title_bar.addWidget(self.settings_btn)
         
-        # Minimize button
-        self.min_btn = QPushButton("-")
-        self.min_btn.setFixedSize(28, 20)
-        self.min_btn.setStyleSheet(f"""
-            QPushButton {{
-                background: transparent;
-                color: {self.theme['text_secondary']};
-                border: 1px solid {self.theme['border']};
-                border-radius: 4px;
-                font-size: {self.font_size}px;
-                padding: 2px;
-            }}
-            QPushButton:hover {{
-                background: {self.theme['hover']};
-                color: {self.theme['text']};
-            }}
-        """)
-        self.min_btn.clicked.connect(self._minimize_to_tray)
-        title_bar.addWidget(self.min_btn)
-        
-        # Close button
-        self.close_btn = QPushButton("x")
-        self.close_btn.setFixedSize(28, 20)
-        self.close_btn.setStyleSheet(f"""
-            QPushButton {{
-                background: transparent;
-                color: {self.theme['text_secondary']};
-                border: 1px solid {self.theme['border']};
-                border-radius: 4px;
-                font-size: {self.font_size}px;
-                padding: 2px;
-            }}
-            QPushButton:hover {{
-                background: {self.theme['priority_high']};
-                color: white;
-            }}
-        """)
-        self.close_btn.clicked.connect(self.close)
-        title_bar.addWidget(self.close_btn)
+        # 顶部窗口按钮:macOS 用原生红绿灯样式,其他平台保留字符按钮
+        if is_macos():
+            self.traffic_lights = TrafficLightButtons()
+            self.traffic_lights.close_clicked.connect(self.close)
+            self.traffic_lights.minimize_clicked.connect(self._minimize_to_tray)
+            self.traffic_lights.zoom_clicked.connect(
+                lambda: self._toggle_ontop(
+                    not self.config.get("always_on_top", True)
+                )
+            )
+            title_bar.addWidget(self.traffic_lights)
+        else:
+            # Minimize button
+            self.min_btn = QPushButton("-")
+            self.min_btn.setFixedSize(28, 20)
+            self.min_btn.setStyleSheet(f"""
+                QPushButton {{
+                    background: transparent;
+                    color: {self.theme['text_secondary']};
+                    border: 1px solid {self.theme['border']};
+                    border-radius: 4px;
+                    font-size: {self.font_size}px;
+                    padding: 2px;
+                }}
+                QPushButton:hover {{
+                    background: {self.theme['hover']};
+                    color: {self.theme['text']};
+                }}
+            """)
+            self.min_btn.clicked.connect(self._minimize_to_tray)
+            title_bar.addWidget(self.min_btn)
+
+            # Close button
+            self.close_btn = QPushButton("x")
+            self.close_btn.setFixedSize(28, 20)
+            self.close_btn.setStyleSheet(f"""
+                QPushButton {{
+                    background: transparent;
+                    color: {self.theme['text_secondary']};
+                    border: 1px solid {self.theme['border']};
+                    border-radius: 4px;
+                    font-size: {self.font_size}px;
+                    padding: 2px;
+                }}
+                QPushButton:hover {{
+                    background: {self.theme['priority_high']};
+                    color: white;
+                }}
+            """)
+            self.close_btn.clicked.connect(self.close)
+            title_bar.addWidget(self.close_btn)
 
         title_widget = QWidget()
         title_widget.setLayout(title_bar)
