@@ -2,7 +2,7 @@ from PyQt5.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QLineEdit, QPushButton, QScrollArea, QFrame, QSplitter,
     QSizePolicy, QApplication, QMessageBox, QInputDialog, QMenu,
-    QSystemTrayIcon, QAction, QSizeGrip
+    QSystemTrayIcon, QAction
 )
 from PyQt5.QtCore import Qt, QPoint, QTimer, pyqtSignal
 from PyQt5.QtGui import QFont, QCursor, QColor,QIcon
@@ -13,6 +13,7 @@ from .styles import get_stylesheet, StyleHelper
 from .task_card import TaskCard, CategoryItem
 from .dialogs import TaskDialog
 from .settings_dialogs import SettingsDialog, StatsDialog
+from .resize_handle import ResizeHandle
 
 class MainWindow(QMainWindow):
     theme_changed = pyqtSignal()
@@ -337,10 +338,12 @@ class MainWindow(QMainWindow):
         self.setMaximumSize(600, 900)
 
         # 右下角 resize grip(FramelessWindowHint 没有系统边框,需要手动加)
-        # QSizeGrip 放在 MainWindow 自身(不是 container),手动定位到右下角,
-        # 避免影响 central widget 的布局。
-        self.size_grip = QSizeGrip(self)
-        self.size_grip.setFixedSize(16, 16)
+        # 自绘斜线 grip,避免 QSizeGrip 在某些 Qt 版本下破坏父 widget 的圆角样式。
+        self.size_grip = ResizeHandle(self)
+        self.size_grip.move(
+            self.width() - self.size_grip.width(),
+            self.height() - self.size_grip.height(),
+        )
     
     def _make_filter_btn(self, text, filter_type):
         btn = QPushButton(text)
