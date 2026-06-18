@@ -1,8 +1,8 @@
 from PyQt5.QtWidgets import (
-    QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, 
+    QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QLineEdit, QPushButton, QScrollArea, QFrame, QSplitter,
     QSizePolicy, QApplication, QMessageBox, QInputDialog, QMenu,
-    QSystemTrayIcon, QAction
+    QSystemTrayIcon, QAction, QSizeGrip
 )
 from PyQt5.QtCore import Qt, QPoint, QTimer, pyqtSignal
 from PyQt5.QtGui import QFont, QCursor, QColor,QIcon
@@ -335,6 +335,12 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(self.container)
         self.setMinimumSize(320, 480)
         self.setMaximumSize(600, 900)
+
+        # 右下角 resize grip(FramelessWindowHint 没有系统边框,需要手动加)
+        # QSizeGrip 放在 MainWindow 自身(不是 container),手动定位到右下角,
+        # 避免影响 central widget 的布局。
+        self.size_grip = QSizeGrip(self)
+        self.size_grip.setFixedSize(16, 16)
     
     def _make_filter_btn(self, text, filter_type):
         btn = QPushButton(text)
@@ -678,6 +684,12 @@ class MainWindow(QMainWindow):
     
     def resizeEvent(self, event):
         super().resizeEvent(event)
+        # 把 size_grip 始终放在右下角(随窗口 resize 重新定位)
+        if hasattr(self, "size_grip"):
+            self.size_grip.move(
+                self.width() - self.size_grip.width(),
+                self.height() - self.size_grip.height(),
+            )
         self.config.set("window_size", [self.width(), self.height()])
     
     def moveEvent(self, event):
