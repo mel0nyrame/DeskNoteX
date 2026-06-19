@@ -455,11 +455,46 @@ def remove_macos_status_item(status_item, bar):
 
 
 def show_macos_notification(title, message, duration_ms=5000):
-    """在 macOS 上用 NSUserNotification 显示系统通知。
+    """在 macOS 上显示系统通知。
 
-    NSUserNotification 在 macOS 10.14+ 已废弃,但仍可用。UNUserNotificationCenter
-    需要 bundle ID 和 code signing,这里不引入这种复杂性。
+    策略(osascript 优先):
+    1. osascript 'display notification' —— 所有 macOS 版本均可用,真正显示在通知中心
+       (NSUserNotification 在 macOS 11+ 已被系统忽略,即使 deliverNotification_
+       成功也只在控制台记一行 log,用户看不到气泡)
+    2. 失败时 fallback 到 NSUserNotification(legacy API,部分环境仍可工作)
     """
+    import subprocess
+
+    def _escape_applescript(s):
+        # AppleScript 字符串内需要转义反斜杠与双引号;
+        # 换行 / 回车替换为空格 —— osascript -e 内的多行字符串解析不可靠,
+        # 换行后的内容会被当作 AppleScript 语句继续解析,常见错误:
+        # `execution error: The variable line2 is not defined.`。
+        return (
+            str(s)
+            .replace("\\", "\\\\")
+            .replace('"', '\\"')
+            .replace("\n", " ")
+            .replace("\r", " ")
+        )
+
+    try:
+        title_esc = _escape_applescript(title)
+        msg_esc = _escape_applescript(message)
+        script = f'display notification "{msg_esc}" with title "{title_esc}"'
+        subprocess.Popen(
+            ['osascript', '-e', script],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return
+    except Exception as exc:
+        print(
+            f"[platform_utils] osascript 通知失败,fallback 到 NSUserNotification: {exc}",
+            file=sys.stderr,
+        )
+
+    # Legacy fallback:macOS 10.14 之前的 NSUserNotification 仍可用
     try:
         from AppKit import NSUserNotification, NSUserNotificationCenter
         note = NSUserNotification.alloc().init()

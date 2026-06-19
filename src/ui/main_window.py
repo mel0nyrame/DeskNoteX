@@ -13,13 +13,25 @@ from .styles import get_stylesheet, StyleHelper
 from .task_card import TaskCard, CategoryItem
 from .dialogs import TaskDialog
 from .settings_dialogs import SettingsDialog, StatsDialog
-from .resize_handle import ResizeHandle
+from .resize_handle import ResizeHandle, Edge
 
 class MainWindow(QMainWindow):
     theme_changed = pyqtSignal()
 
     def __init__(self):
-        super().__init__(None, Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
+        # 配置必须先加载 —— 下面的 super().__init__ 要按 config["always_on_top"]
+        # 决定是否在初始 flags 里加 WindowStaysOnTopHint。若 __init__ 一开始就把
+        # StaysOnTopHint 硬编码进 flags,后续 _restore_geometry 无法清除它,
+        # always_on_top=False 在启动阶段会失效。
+        self.config = ConfigManager()
+        self.db = DatabaseManager()
+        self.theme = self.config.get_theme()
+        self.font_family, self.font_size = self.config.get_font()
+
+        flags = Qt.FramelessWindowHint
+        if self.config.get("always_on_top", True):
+            flags |= Qt.WindowStaysOnTopHint
+        super().__init__(None, flags)
         self.setAttribute(Qt.WA_TranslucentBackground)
         # macOS 上要真正实现逐像素透明,除了 WA_TranslucentBackground 还必须
         # 加 WA_NoSystemBackground,否则 AppKit 仍会画一层系统背景,
@@ -35,31 +47,34 @@ class MainWindow(QMainWindow):
         else:
             self.setWindowIcon(QApplication.style().standardIcon(QApplication.style().SP_ComputerIcon))
 
-        self.config = ConfigManager()
-        self.db = DatabaseManager()
-        self.theme = self.config.get_theme()
-        self.font_family, self.font_size = self.config.get_font()
-        
         self.drag_pos = None
         self.resizing = False
         self.resize_edge = None
         self.current_category = None
         self.current_filter = "all"  # all, active, completed
-        
+
+        # Config save debounce:必须在 _setup_ui / _restore_geometry 之前建好,
+        # 否则后者触发的 moveEvent / resizeEvent → _save_config 访问未初始化的 timer 抛 AttributeError。
+        # _save_config 用 ConfigManager.update(纯内存)避免逐像素同步写盘,
+        # 500ms 静止后再由 _flush_config_save 调 save() 一次性落盘。
+        self._config_save_timer = QTimer()
+        self._config_save_timer.setSingleShot(True)
+        self._config_save_timer.timeout.connect(self._flush_config_save)
+
         self._setup_ui()
         self._apply_theme()
         self._load_data()
         self._restore_geometry()
-        
+
         # Notification worker
         # 新代码（修复）
         self.notify_worker = NotificationWorker(self.config)
         self.notify_worker.notify.connect(self._show_notification)
         self.notify_worker.start()
-        
+
         # Edge tuck manager
         self.tuck_manager = EdgeTuckManager(self, self.config)
-        
+
         # Auto refresh timer
         self.refresh_timer = QTimer()
         self.refresh_timer.timeout.connect(self._load_tasks)
@@ -351,13 +366,23 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(320, 480)
         self.setMaximumSize(600, 900)
 
-        # 右下角 resize grip(FramelessWindowHint 没有系统边框,需要手动加)
-        # 自绘斜线 grip,避免 QSizeGrip 在某些 Qt 版本下破坏父 widget 的圆角样式。
-        self.size_grip = ResizeHandle(self)
-        self.size_grip.move(
-            self.width() - self.size_grip.width(),
-            self.height() - self.size_grip.height(),
-        )
+        # 8 个不可见 resize grip:4 角 + 4 边中点,让 FramelessWindowHint 窗口也能从
+        # 任意边/角拖动 resize(替代 QSizeGrip,避免后者影响父 widget 圆角样式)。
+        # 注意:不要在这里 move —— 此时 _restore_geometry 还没跑,self.width()/height()
+        # 还是默认 ~100x30,grip 会落在错位置。位置由 resizeEvent 在 _restore_geometry()
+        # 里的 self.resize() 触发后修正。
+        self._resize_handles = [
+            ResizeHandle(Edge.TOPLEFT, self),
+            ResizeHandle(Edge.TOP, self),
+            ResizeHandle(Edge.TOPRIGHT, self),
+            ResizeHandle(Edge.LEFT, self),
+            ResizeHandle(Edge.RIGHT, self),
+            ResizeHandle(Edge.BOTTOMLEFT, self),
+            ResizeHandle(Edge.BOTTOM, self),
+            ResizeHandle(Edge.BOTTOMRIGHT, self),
+        ]
+        # 兼容旧引用(仅保留右下角这一个 — 在 resizeEvent 里也用它布局)。
+        self.size_grip = self._resize_handles[-1]
     
     def _make_filter_btn(self, text, filter_type):
         btn = QPushButton(text)
@@ -401,21 +426,34 @@ class MainWindow(QMainWindow):
         size = self.config.get("window_size", [420, 640])
         self.move(pos[0], pos[1])
         self.resize(size[0], size[1])
-        
+
         if self.config.get("always_on_top", True):
             self.setWindowFlags(self.windowFlags() | Qt.WindowStaysOnTopHint)
+            # setWindowFlags 会丢失 WA_TranslucentBackground / WA_NoSystemBackground,
+            # 在 macOS 上圆角之外的区域被系统背景填充,看起来圆角消失。
+            self.setAttribute(Qt.WA_TranslucentBackground)
+            self.setAttribute(Qt.WA_NoSystemBackground)
     
     def _load_data(self):
+        # closeEvent 会把 self.db = None,但 refresh_timer.stop() 之前已经 post 到
+        # 事件队列的回调仍会被派发,在这里访问 self.db 会 AttributeError。
+        # 入口处守门,任何 _load_* 链路不再依赖 db 时就直接返回。
+        if not self.db:
+            return
         self._load_categories()
         self._load_tasks()
     
     def _load_categories(self):
+        # closeEvent 会把 self.db = None,但 refresh_timer.stop() 之前已经 post 到
+        # 事件队列的回调仍会被派发,在这里访问 self.db 会 AttributeError。
+        if not self.db:
+            return
         # Clear existing
         while self.cat_layout.count() > 1:
             item = self.cat_layout.takeAt(0)
             if item.widget():
                 item.widget().deleteLater()
-        
+
         categories = self.db.get_categories()
         for cat in categories:
             item = CategoryItem(cat, self.theme, self.font_family, self.font_size, 
@@ -424,6 +462,10 @@ class MainWindow(QMainWindow):
             self.cat_layout.insertWidget(self.cat_layout.count() - 1, item)
     
     def _load_tasks(self):
+        # closeEvent 会把 self.db = None,但 refresh_timer.stop() 之前已经 post 到
+        # 事件队列的回调仍会被派发,在这里访问 self.db 会 AttributeError。
+        if not self.db:
+            return
         # Clear task list
         while self.task_layout.count() > 1:
             item = self.task_layout.takeAt(0)
@@ -466,6 +508,8 @@ class MainWindow(QMainWindow):
             self.task_layout.insertWidget(self.task_layout.count() - 1, card)
         
         # Load archived tasks
+        # 归档区保持独立:不论当前分类,展示所有已归档任务(主列表已按当前分类筛过,
+        # 归档区继续显示全量,让用户能找到跨分类的归档任务)。
         archived = self.db.get_tasks(archived=True, search=search)
         for task in archived:
             card = TaskCard(task, self.theme, self.font_family, self.font_size)
@@ -506,10 +550,14 @@ class MainWindow(QMainWindow):
         pass
     
     def _on_task_toggled(self, task_id, completed):
-        self.db.update_task(task_id, status=1 if completed else 0, completed_at=None if not completed else None)
-        if completed:
-            from datetime import datetime
-            self.db.update_task(task_id, completed_at=datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+        # 一次 update_task 同时设 status 和 completed_at。
+        # 旧版本里 completed_at=None if not completed else None 两个分支都是 None(copy-paste 错),
+        # 依赖紧随其后的第二次 update_task 才把 completed_at 写成 now,脆弱修复。
+        from datetime import datetime
+        completed_at = (
+            datetime.now().strftime('%Y-%m-%d %H:%M:%S') if completed else None
+        )
+        self.db.update_task(task_id, status=1 if completed else 0, completed_at=completed_at)
         self._load_tasks()
     
     def _on_task_delete(self, task_id):
@@ -519,16 +567,17 @@ class MainWindow(QMainWindow):
             self._load_tasks()
     
     def _on_task_edit(self, task_id):
-        task = self.db.get_tasks(archived=False)
-        task = next((t for t in task if t['id'] == task_id), None)
+        # 用按 id 精确查询替代旧的 get_tasks(全表)+ next() 模式
+        # (大库 N+1、顺序不稳可能改错行)。
+        task = self.db.get_task_by_id(task_id)
         if not task:
             return
         categories = self.db.get_categories()
         dialog = TaskDialog(self, self.theme, self.font_family, self.font_size, task=task, categories=categories)
         if dialog.exec_() == TaskDialog.Accepted:
             data = dialog.get_data()
-            for k, v in data.items():
-                self.db.update_task(task_id, **{k: v})
+            # 一次 update_task 合并所有字段(单事务,内部循环 UPDATE,单 commit)
+            self.db.update_task(task_id, **data)
             self._load_tasks()
     
     def _on_task_archive(self, task_id):
@@ -632,8 +681,8 @@ class MainWindow(QMainWindow):
         dialog = SettingsDialog(self, self.config, self.theme, self.font_family, self.font_size)
         if dialog.exec_() == SettingsDialog.Accepted:
             new_config = dialog.get_config()
-            for k, v in new_config.items():
-                self.config.set(k, v)
+            # 用 set_many 一次性写盘,避免循环 set 触发 6 次同步文件写。
+            self.config.set_many(new_config)
             self._reload_theme()
     
     def _open_stats(self):
@@ -650,6 +699,10 @@ class MainWindow(QMainWindow):
             self.setWindowFlags(self.windowFlags() | Qt.WindowStaysOnTopHint)
         else:
             self.setWindowFlags(self.windowFlags() & ~Qt.WindowStaysOnTopHint)
+        # setWindowFlags 会丢失 WA_TranslucentBackground / WA_NoSystemBackground,
+        # 需要重新设置,否则 macOS 上圆角消失。
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setAttribute(Qt.WA_NoSystemBackground)
         if was_visible:
             self.show()
             self.setGeometry(geo)
@@ -665,8 +718,12 @@ class MainWindow(QMainWindow):
         if not hasattr(self, 'tray_manager') or not self.tray_manager:
             return
         from ..core.platform_utils import show_notification
+        # macOS 后端 TrayManager._init_macos 不设 self.tray(只设 status_item),
+        # 直接读 self.tray_manager.tray 会 AttributeError;用 getattr 兜底为 None。
+        # show_notification 的 macOS 路径(line 157-159)会忽略 tray_icon 参数。
+        tray = getattr(self.tray_manager, 'tray', None)
         show_notification(
-            self.tray_manager.tray,
+            tray,
             title,
             message,
             color,
@@ -703,19 +760,56 @@ class MainWindow(QMainWindow):
     
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        # 把 size_grip 始终放在右下角(随窗口 resize 重新定位)
-        if hasattr(self, "size_grip"):
-            self.size_grip.move(
-                self.width() - self.size_grip.width(),
-                self.height() - self.size_grip.height(),
-            )
-        self.config.set("window_size", [self.width(), self.height()])
-    
+        # 把每个 ResizeHandle 放到对应边/角(随窗口 resize 重新定位)
+        if hasattr(self, "_resize_handles"):
+            w, h = self.width(), self.height()
+            for handle in self._resize_handles:
+                edge = handle.edge
+                hw, hh = handle.width(), handle.height()
+                if edge == Edge.TOPLEFT:
+                    handle.move(0, 0)
+                elif edge == Edge.TOP:
+                    handle.move((w - hw) // 2, 0)
+                elif edge == Edge.TOPRIGHT:
+                    handle.move(w - hw, 0)
+                elif edge == Edge.LEFT:
+                    handle.move(0, (h - hh) // 2)
+                elif edge == Edge.RIGHT:
+                    handle.move(w - hw, (h - hh) // 2)
+                elif edge == Edge.BOTTOMLEFT:
+                    handle.move(0, h - hh)
+                elif edge == Edge.BOTTOM:
+                    handle.move((w - hw) // 2, h - hh)
+                elif edge == Edge.BOTTOMRIGHT:
+                    handle.move(w - hw, h - hh)
+        self._save_config("window_size", [self.width(), self.height()])
+
     def moveEvent(self, event):
         super().moveEvent(event)
-        self.config.set("window_pos", [self.x(), self.y()])
+        self._save_config("window_pos", [self.x(), self.y()])
+
+    def _save_config(self, key, value):
+        """延迟写:仅更新内存 + 重启 debounce timer(500ms 后 flush)。
+
+        替代 self.config.set(...) 在 resizeEvent/moveEvent 等高频场景直接调用,
+        避免每像素一次磁盘写 + 半截损坏风险。
+
+        注意:必须用 update()(纯内存)而非 set()(立即落盘),否则 debounce 完全失效。
+        """
+        self.config.update(key, value)
+        self._config_save_timer.start(500)
+
+    def _flush_config_save(self):
+        """debounce timer 回调:把内存里的 config 真正写入磁盘。"""
+        self.config.save()
     
     def closeEvent(self, event):
+        # 优先 flush debounce timer:用户最近一次 resize/move 还在 500ms 窗口内时,
+        # 若不显式 flush 就关闭,最新的 window_size/window_pos 不会落盘。
+        # 这里 stop() 后立即 save(),确保关闭瞬间配置完整。
+        if self._config_save_timer.isActive():
+            self._config_save_timer.stop()
+            self.config.save()
         # 先停 refresh_timer,避免它在 db close 后触发 _load_tasks
         if hasattr(self, 'refresh_timer') and self.refresh_timer:
             self.refresh_timer.stop()

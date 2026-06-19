@@ -105,7 +105,14 @@ class TaskDialog(QDialog):
         layout.addLayout(row1)
         
         # Due date
-        layout.addWidget(QLabel("截止时间"))
+        due_row = QHBoxLayout()
+        self.due_enabled_check = QCheckBox("截止时间")
+        self.due_enabled_check.setChecked(bool(self.task and self.task.get('due_date')) or not self.task)
+        self.due_enabled_check.toggled.connect(self._on_due_enabled_toggled)
+        due_row.addWidget(self.due_enabled_check)
+        due_row.addStretch()
+        layout.addLayout(due_row)
+
         self.due_edit = QDateTimeEdit()
         self.due_edit.setCalendarPopup(True)
         self.due_edit.setDisplayFormat("yyyy-MM-dd HH:mm")
@@ -115,6 +122,11 @@ class TaskDialog(QDialog):
             self.due_edit.setDateTime(QDateTime(dt.year, dt.month, dt.day, dt.hour, dt.minute))
         else:
             self.due_edit.setDateTime(QDateTime.currentDateTime().addSecs(3600))
+        # 编辑模式无 due_date 时,默认勾选=启用(避免丢旧任务数据);
+        # 新建模式 + 未勾选时,_save 写 None。
+        if self.task and not self.task.get('due_date'):
+            self.due_enabled_check.setChecked(False)
+        self._on_due_enabled_toggled(self.due_enabled_check.isChecked())
         self.due_edit.setStyleSheet(f"""
             QDateTimeEdit {{
                 background: {self.theme['input_bg']};
@@ -306,23 +318,32 @@ class TaskDialog(QDialog):
         if not title:
             QMessageBox.warning(self, "提示", "请输入任务标题")
             return
-        
+
         from datetime import datetime
-        due_dt = self.due_edit.dateTime().toPyDateTime()
+        # due_enabled_check 未勾选 → 写 None(用户明确不要截止日期)。
+        if self.due_enabled_check.isChecked():
+            due_dt = self.due_edit.dateTime().toPyDateTime()
+            due_date = due_dt.strftime('%Y-%m-%d %H:%M:%S')
+        else:
+            due_date = None
         remind_dt = self.remind_edit.dateTime().toPyDateTime()
-        
+
         self.result_data = {
             'title': title,
             'content': self.content_edit.toPlainText().strip(),
             'category_id': self.cat_combo.currentData(),
             'priority': self.pri_combo.currentData(),
-            'due_date': due_dt.strftime('%Y-%m-%d %H:%M:%S'),
+            'due_date': due_date,
             'remind_time': remind_dt.strftime('%Y-%m-%d %H:%M:%S'),
             'remind_enabled': 1 if self.remind_check.isChecked() else 0,
             'repeat_type': self.repeat_combo.currentData(),
             'repeat_interval': self.interval_spin.value(),
         }
         self.accept()
-    
+
+    def _on_due_enabled_toggled(self, checked):
+        """勾选切换时同步启用/禁用 due_edit,避免改值后被忽略。"""
+        self.due_edit.setEnabled(checked)
+
     def get_data(self):
         return self.result_data

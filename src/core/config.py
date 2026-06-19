@@ -13,6 +13,14 @@ DB_PATH = os.path.join(APP_DIR, "data.db")
 CONFIG_PATH = os.path.join(APP_DIR, "config.json")
 
 # Default theme colors
+
+# tasks 表允许的列名白名单(供 add_task / update_task 校验 kwargs key 用)
+_VALID_TASK_FIELDS = frozenset({
+    'title', 'content', 'category_id', 'priority', 'status',
+    'due_date', 'remind_time', 'remind_enabled',
+    'repeat_type', 'repeat_interval',
+    'created_at', 'completed_at', 'archived',
+})
 THEME_LIGHT = {
     "window": "#FBF9F7",
     "card": "#FFFFFF",
@@ -68,6 +76,10 @@ DEFAULT_CONFIG = {
     }
 }
 
+# config.json 允许的 key 白名单(供 set_many 校验用,防止 SettingsDialog 或其他
+# 调用方意外写入任意 key 污染配置文件)。新增持久化配置项时务必同步加到这里。
+_VALID_CONFIG_KEYS = frozenset(DEFAULT_CONFIG.keys())
+
 class ConfigManager:
     def __init__(self):
         os.makedirs(APP_DIR, exist_ok=True)
@@ -99,12 +111,37 @@ class ConfigManager:
     def save(self):
         with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
             json.dump(self.config, f, ensure_ascii=False, indent=2)
-    
+
     def get(self, key, default=None):
         return self.config.get(key, default)
-    
-    def set(self, key, value):
+
+    def update(self, key, value):
+        """仅写入内存,不落盘。
+
+        配合 debounce timer 批量落盘(resizeEvent / moveEvent 每像素触发,若每次都
+        同步写盘会卡顿 + 半截损坏风险)。需要落盘时显式调 save()。
+        """
         self.config[key] = value
+
+    def set(self, key, value):
+        """写入内存并立即落盘。"""
+        self.update(key, value)
+        self.save()
+
+    def set_many(self, updates):
+        """批量更新:一次内存写 + 一次磁盘写,适合设置保存等场景。
+
+        替代 for k, v: self.set(k, v) 循环触发的 N 次磁盘 I/O。
+
+        仅接受 DEFAULT_CONFIG 中存在的 key,任意其它 key 直接抛 ValueError,
+        避免 SettingsDialog 或将来的配置源意外污染 config.json。
+        """
+        invalid = set(updates) - _VALID_CONFIG_KEYS
+        if invalid:
+            raise ValueError(f"set_many: invalid config key(s) {sorted(invalid)}")
+        if not updates:
+            return
+        self.config.update(updates)
         self.save()
     
     def get_theme(self):
@@ -129,6 +166,10 @@ class DatabaseManager:
     
     def _init_tables(self):
         cursor = self.conn.cursor()
+        # 开启 SQLite 外键约束(SQLite 默认关闭 FK,即便 schema 写了 FOREIGN KEY 也不生效)。
+        # 开启后 tasks.category_id 引用不存在分类的 INSERT 会被拒绝,
+        # 配合 delete_category 的默认分类保护(F7),避免孤儿任务与统计错位。
+        cursor.execute('PRAGMA foreign_keys = ON')
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS categories (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -196,13 +237,23 @@ class DatabaseManager:
         self.conn.commit()
     
     def delete_category(self, cat_id):
+        # 保护默认分类(id=1):删除后所有依赖默认 category_id=1 的代码
+        # (get_tasks LEFT JOIN / add_task 默认值 / StatsDialog 统计)都会出错。
+        if cat_id == 1:
+            return False
         cursor = self.conn.cursor()
         # Move tasks to default category
         cursor.execute('UPDATE tasks SET category_id = 1 WHERE category_id = ?', (cat_id,))
         cursor.execute('DELETE FROM categories WHERE id = ?', (cat_id,))
         self.conn.commit()
+        return True
     
     def add_task(self, **kwargs):
+        # 字段名白名单:避免 kwargs key 被原样拼进 SQL
+        # (覆盖 id 主键、注入列名等)。
+        invalid = set(kwargs) - _VALID_TASK_FIELDS
+        if invalid:
+            raise ValueError(f"add_task: invalid field(s) {sorted(invalid)}")
         cursor = self.conn.cursor()
         fields = []
         values = []
@@ -230,8 +281,24 @@ class DatabaseManager:
         query += ' ORDER BY t.priority DESC, t.due_date ASC, t.created_at DESC'
         cursor.execute(query, params)
         return [dict(row) for row in cursor.fetchall()]
+
+    def get_task_by_id(self, task_id):
+        """按主键精确查询单条任务,替代 get_tasks + next() 全表扫描。"""
+        cursor = self.conn.cursor()
+        cursor.execute(
+            'SELECT t.*, c.name as category_name, c.color as category_color '
+            'FROM tasks t LEFT JOIN categories c ON t.category_id = c.id '
+            'WHERE t.id = ?',
+            (task_id,),
+        )
+        row = cursor.fetchone()
+        return dict(row) if row else None
     
     def update_task(self, task_id, **kwargs):
+        # 字段名白名单:同 add_task,防止 kwargs key 被原样拼进 SQL。
+        invalid = set(kwargs) - _VALID_TASK_FIELDS
+        if invalid:
+            raise ValueError(f"update_task: invalid field(s) {sorted(invalid)}")
         cursor = self.conn.cursor()
         for k, v in kwargs.items():
             cursor.execute(f'UPDATE tasks SET {k} = ? WHERE id = ?', (v, task_id))
@@ -268,8 +335,10 @@ class DatabaseManager:
     
     def mark_reminder_sent(self, task_id):
         cursor = self.conn.cursor()
-        cursor.execute('INSERT OR REPLACE INTO reminders_sent (task_id, sent_at) VALUES (?, ?)', 
-                      (task_id, datetime.now()))
+        # 显式 ISO 字符串,与 tasks 表里 due_date/remind_time 等字段保持一致;
+        # sqlite3 默认 detect_types=0 会把 datetime 对象写成 Python repr,与 ISO 字符串不兼容。
+        cursor.execute('INSERT OR REPLACE INTO reminders_sent (task_id, sent_at) VALUES (?, ?)',
+                      (task_id, datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
         self.conn.commit()
     
     def get_due_repeats(self):
@@ -331,12 +400,19 @@ class DatabaseManager:
                 day = min(old_due.day, [31,29 if year%4==0 and (year%100!=0 or year%400==0) else 28,31,30,31,30,31,31,30,31,30,31][month-1])
                 new_due = old_due.replace(year=year, month=month, day=day)
             elif repeat == 'yearly':
-                new_due = old_due.replace(year=old_due.year + interval)
+                # 闰年保护:Feb 29 + yearly → 非闰年(2025/2026/...)replace 抛 ValueError,
+                # 失败时回退到 Feb 28,避免循环任务彻底中断。
+                try:
+                    new_due = old_due.replace(year=old_due.year + interval)
+                except ValueError:
+                    new_due = old_due.replace(
+                        year=old_due.year + interval, day=28,
+                    )
         
         cursor.execute('''
             INSERT INTO tasks (title, content, category_id, priority, status, due_date, remind_time, remind_enabled, repeat_type, repeat_interval, created_at)
             VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?)
-        ''', (task['title'], task['content'], task['category_id'], task['priority'], 
+        ''', (task['title'], task['content'], task['category_id'], task['priority'],
               new_due, task['remind_time'], task['remind_enabled'], task['repeat_type'], task['repeat_interval'], now))
         
         # Mark original as archived to avoid re-spawning
