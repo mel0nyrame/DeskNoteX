@@ -39,13 +39,15 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           pip install pyinstaller
-          # macOS / Linux 上 PyInstaller 需要 .icns 图标;仓库只有 .ico 时
-          # 装 Pillow 让 PyInstaller 自动从 .ico / .png 转换,避免 ValueError:
-          # "Received icon image ... which exists but is not in the correct format."
-          # (Windows runner 可直接用 .ico,无需 Pillow。)
-          if [ "${{ matrix.os }}" != "windows-latest" ]; then
-            pip install Pillow
-          fi
+
+      # macOS / Linux 上 PyInstaller 需要 .icns 图标;仓库只有 .ico 时
+      # 装 Pillow 让 PyInstaller 自动从 .ico / .png 转换,避免 ValueError:
+      # "Received icon image ... which exists but is not in the correct format."
+      # (Windows runner 可直接用 .ico,无需 Pillow。)
+      # 用 step 级 if 条件而非 shell 内 if,避免 PowerShell runner 解析错误。
+      - name: Install Pillow (macOS / Linux)
+        if: matrix.os != 'windows-latest'
+        run: pip install Pillow
 
       - name: Build with PyInstaller
         # build.py 已根据 sys_platform 自动 exclude 大量 Qt 子模块
